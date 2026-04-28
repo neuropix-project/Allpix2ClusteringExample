@@ -101,13 +101,13 @@ gDirectory.ls()
 
 #------------------------------------------ 
 # Check on detector existence
-if not rootfile.GetDirectory("detectors/" + detector_name):
-    print("\nDetector does not exist. Please choose one of the following detectors:")
-    gDirectory.cd("detectors")
-    list_of_keys = gDirectory.GetListOfKeys()
-    for key in list_of_keys:
-        print(key.GetName())
-    exit(1)
+# Accept files with either detector directories or top-level trees
+detector_dir = rootfile.GetDirectory("detectors/" + detector_name)
+
+if detector_dir:
+    print(f"Found detector directory: detectors/{detector_name}")
+else:
+    print("No detectors/ directory found; using top-level trees")
 
 
 # Open Data tree from Allpix2 output files
@@ -253,6 +253,75 @@ for iev in range(0, PixelHit.GetEntries()):
         if denom == 0:
             return 0.0
         return abs(n_pos - n_neg) / denom
+    
+    # ---------------- WEIGHTED HELPERS ----------------
+
+    def _weighted_pca_axis_and_proj(xs, ys, ws):
+        n = len(xs)
+        if n == 0:
+            return (1.0, 0.0), [], [], float("nan"), float("nan")
+
+        wsum = sum(ws)
+        if wsum <= 0:
+            return (1.0, 0.0), [], [], float("nan"), float("nan")
+
+        mx = sum(xs[i] * ws[i] for i in range(n)) / wsum
+        my = sum(ys[i] * ws[i] for i in range(n)) / wsum
+
+        dx = [xs[i] - mx for i in range(n)]
+        dy = [ys[i] - my for i in range(n)]
+
+        sxx = sum(ws[i] * dx[i] * dx[i] for i in range(n)) / wsum
+        syy = sum(ws[i] * dy[i] * dy[i] for i in range(n)) / wsum
+        sxy = sum(ws[i] * dx[i] * dy[i] for i in range(n)) / wsum
+
+        theta = 0.5 * math.atan2(2.0 * sxy, (sxx - syy))
+        ux = math.cos(theta)
+        uy = math.sin(theta)
+
+        proj_major = [dx[i] * ux + dy[i] * uy for i in range(n)]
+        proj_minor = [-dx[i] * uy + dy[i] * ux for i in range(n)]
+
+        trace = sxx + syy
+        det_term = math.sqrt(max((sxx - syy) ** 2 + 4.0 * sxy * sxy, 0.0))
+        lam1 = 0.5 * (trace + det_term)
+        lam2 = 0.5 * (trace - det_term)
+
+        return (ux, uy), proj_major, proj_minor, lam1, lam2
+
+
+    def _weighted_axis_asymmetry(proj_s, ws):
+        if len(proj_s) == 0:
+            return float("nan")
+
+        q_pos = sum(ws[i] for i in range(len(proj_s)) if proj_s[i] > 0)
+        q_neg = sum(ws[i] for i in range(len(proj_s)) if proj_s[i] < 0)
+        denom = q_pos + q_neg
+
+        if denom == 0:
+            return 0.0
+
+        return abs(q_pos - q_neg) / denom
+
+
+    def _weighted_skewness(vals, ws):
+        n = len(vals)
+        if n < 3:
+            return float("nan")
+
+        wsum = sum(ws)
+        if wsum <= 0:
+            return float("nan")
+
+        mean = sum(ws[i] * vals[i] for i in range(n)) / wsum
+        diffs = [vals[i] - mean for i in range(n)]
+
+        m2 = sum(ws[i] * diffs[i] * diffs[i] for i in range(n)) / wsum
+        if m2 == 0:
+            return 0.0
+
+        m3 = sum(ws[i] * diffs[i] * diffs[i] * diffs[i] for i in range(n)) / wsum
+        return m3 / (m2 ** 1.5)
 
     # Compute metrics for each cluster in this event
     for cluster_id, clu in enumerate(cluster_hits):
@@ -298,17 +367,28 @@ for iev in range(0, PixelHit.GetEntries()):
         # Neighbor fraction (4-neighbor)
         neighbor_frac = _neighbor_fraction(xs, ys)
 
-        # axis projections (unweighted) for axis metrics
-        _, proj_s = _pca_axis_and_proj([float(x) for x in xs], [float(y) for y in ys])
-        axis_asym = _axis_asymmetry(proj_s)
+        # charge-weighted PCA axis
+        _, proj_major, proj_minor, lam1, lam2 = _weighted_pca_axis_and_proj(
+            [float(x) for x in xs],
+            [float(y) for y in ys],
+            qabs
+        )
 
-        # Skewness (skip if < 3 hits)
+# ---------------- NEW METRICS ----------------
+
+        # geometric track length (pure geometry)
+        track_length = max(proj_major) - min(proj_major) if len(proj_major) > 0 else float("nan")
+
+        # charge-weighted asymmetry
+        axis_asym_qw = _weighted_axis_asymmetry(proj_major, qabs)
+
+        # charge-weighted skew
         if n_hits < 3:
-            axis_skew = float("nan")
+            axis_skew_qw = float("nan")
             skew_skipped = 1
             skew_skipped_count += 1
         else:
-            axis_skew = _skewness(proj_s)
+            axis_skew_qw = _weighted_skewness(proj_major, qabs)
             skew_skipped = 0
 
         # Store row (one row per cluster)
@@ -326,8 +406,9 @@ for iev in range(0, PixelHit.GetEntries()):
             "mean_r": float(mean_r),
             "rms_r": float(rms_r),
             "r90": float(r90),
-            "axis_asym": float(axis_asym),
-            "axis_skew": float(axis_skew),
+            "track_length": float(track_length),
+            "axis_asym_qw": float(axis_asym_qw),
+            "axis_skew_qw": float(axis_skew_qw),
             "skew_skipped": int(skew_skipped),
             "neighbor_frac": float(neighbor_frac),
         })
@@ -370,7 +451,8 @@ if metrics_out is not None:
                 "size_x", "size_y", "bbox_area", "fill_factor",
                 "cx", "cy",
                 "mean_r", "rms_r", "r90",
-                "axis_asym", "axis_skew", "skew_skipped",
+                "track_length",
+                "axis_asym_qw", "axis_skew_qw", "skew_skipped",
                 "neighbor_frac",
             ]
 
@@ -390,10 +472,11 @@ if metrics_out is not None:
                 data[r, 10] = float(row["mean_r"])
                 data[r, 11] = float(row["rms_r"])
                 data[r, 12] = float(row["r90"])
-                data[r, 13] = float(row["axis_asym"])
-                data[r, 14] = float(row["axis_skew"])
-                data[r, 15] = float(row["skew_skipped"])
-                data[r, 16] = float(row["neighbor_frac"])
+                data[r, 13] = float(row["track_length"])
+                data[r, 14] = float(row["axis_asym_qw"])
+                data[r, 15] = float(row["axis_skew_qw"])
+                data[r, 16] = float(row["skew_skipped"])
+                data[r, 17] = float(row["neighbor_frac"])
 
             dset = hf.create_dataset("clusters", data=data, compression="gzip")
             dset.attrs["columns"] = np.array(cols, dtype=h5py.string_dtype(encoding="utf-8"))
